@@ -20,7 +20,7 @@
 ## Install (one line)
 
 ```bash
-curl -sL https://raw.githubusercontent.com/congzhangzh/ansible-tui/main/install.sh | bash
+curl -sL https://raw.githubusercontent.com/zidesm/ansible-tui/main/install.sh | bash
 sudo mv ansible-tui /usr/local/bin/
 ```
 

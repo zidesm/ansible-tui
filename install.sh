@@ -3,7 +3,7 @@ set -e
 
 # Ansible TUI simple installer
 
-REPO="congzhangzh/ansible-tui"
+REPO="zidesm/ansible-tui"
 BINARY_NAME="ansible-tui"
 
 # Detect OS and architecture
