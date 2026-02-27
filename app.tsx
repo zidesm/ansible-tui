@@ -399,7 +399,17 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
   const [tick, setTick] = useState(0);
 
   // Derived counts for panel headers
-  const totalHosts = useMemo(() => hostGroups.reduce((n, g) => n + g.hosts.length, 0), [hostGroups]);
+  const allUniqueHosts = useMemo(() => {
+    const unique = new Set<string>();
+    for (const g of hostGroups) {
+      for (const h of g.hosts) {
+        unique.add(h);
+      }
+    }
+    return unique;
+  }, [hostGroups]);
+  
+  const totalHosts = allUniqueHosts.size;
   const selectedHostCount = hostSel.size;
   const totalTasks = useMemo(() => items.filter((i) => i.type === "task").length, [items]);
   const selectedTaskCount = useMemo(
@@ -537,8 +547,7 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
       if (key.pageUp) setHCur((c) => Math.max(0, c - viewH));
       if (key.pageDown) setHCur((c) => Math.min(flatHosts.length - 1, c + viewH));
       if (input === "a") {
-        const all = hostGroups.flatMap((g) => g.hosts);
-        setHostSel((p) => (all.every((h) => p.has(h)) ? new Set() : new Set(all)));
+        setHostSel((p) => (allUniqueHosts.size === p.size && [...p].every(h => allUniqueHosts.has(h)) ? new Set() : new Set(allUniqueHosts)));
       }
       if (input === " ") {
         const hi = flatHosts[hCur];
