@@ -288,9 +288,20 @@ function parsePlaybook(filePath: string): FlatItem[] {
 
 // ===== Command Builder =====
 
-function buildCommand(hosts: Set<string>, checked: Set<string>, items: FlatItem[], inv: string, pb: string): string {
+function buildCommand(
+  hosts: Set<string>,
+  checked: Set<string>,
+  items: FlatItem[],
+  inv: string,
+  pb: string,
+  allHostsSelected: boolean,
+): string {
   const parts = ["ansible-playbook", "-i", inv, pb];
-  if (hosts.size > 0) parts.push("--limit", [...hosts].join(","));
+  if (allHostsSelected) {
+    parts.push("--limit", "all");
+  } else if (hosts.size > 0) {
+    parts.push("--limit", [...hosts].join(","));
+  }
   const tags = new Set<string>();
   for (const id of checked) {
     const it = items.find((i) => i.id === id);
@@ -395,10 +406,13 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
     () => [...taskSel].filter((id) => items.find((i) => i.id === id)?.type === "task").length,
     [taskSel, items],
   );
+  const allHostsSelected = totalHosts > 0 && selectedHostCount === totalHosts;
 
   const visible = useMemo(() => items.filter((i) => {
     if (i.type === "play") return true;
-    if (!expanded.has(`p${i.playIndex}`)) return false;
+    // Block or task: check if the play is expanded
+    const playId = `p${i.playIndex}`;
+    if (!expanded.has(playId)) return false;
     // Walk parent chain — all ancestor blocks must be expanded
     let pid = i.parentId;
     while (pid) {
@@ -419,7 +433,7 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
   const hScrollStart = Math.max(0, Math.min(safeHCur - Math.floor(viewH / 2), Math.max(0, flatHosts.length - viewH)));
   const hostSlice = flatHosts.slice(hScrollStart, hScrollStart + viewH);
 
-  const cmd = buildCommand(hostSel, taskSel, items, inv, pb);
+  const cmd = buildCommand(hostSel, taskSel, items, inv, pb, allHostsSelected);
   const fullCmd = cmd + (checkFlag ? " --check" : "") + (diffFlag ? " --diff" : "");
   const hasTags = cmd.includes("--tags");
   const hasTaskSelection = [...taskSel].some((id) => items.find((i) => i.id === id)?.type === "task");
