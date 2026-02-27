@@ -89,7 +89,81 @@ that gives you a visual interactive selector right in your terminal.
 
 ---
 
-## Usage
+## Inventory formats
+
+### Single YAML file (traditional)
+
+```yaml
+all:
+  children:
+    webservers:
+      hosts:
+        web1.example.com:
+        web2.example.com:
+    dbservers:
+      hosts:
+        db1.example.com:
+        db2.example.com:
+```
+
+### Single INI file
+
+```ini
+[webservers]
+web1.example.com
+web2.example.com
+web3.example.com ansible_host=10.0.1.3
+
+[dbservers]
+db1.example.com
+db2.example.com
+```
+
+Supports inline host variables (e.g., `ansible_host=10.0.1.3`) — the hostname is extracted as the first token.
+
+### Folder structure
+
+You can also organize inventory as a directory where each subdirectory or file represents a host group:
+
+```
+inventory/
+├── webservers/
+│   └── hosts.yml
+├── dbservers/
+│   └── hosts.yml
+├── management          # extensionless INI file
+└── cacheservers.ini    # or .ini extension
+```
+
+Each group subdirectory should contain `hosts.yml`, `hosts.yaml`, `main.yml`, or `main.yaml` with one of these formats:
+
+**Map format:**
+```yaml
+hosts:
+  web1.example.com:
+  web2.example.com:
+```
+
+**List format:**
+```yaml
+hosts:
+  - web1.example.com
+  - web2.example.com
+```
+
+**Direct list format:**
+```yaml
+- web1.example.com
+- web2.example.com
+```
+
+INI files at the root level can also use standard INI group syntax.
+
+Pass the folder path as the inventory argument:
+
+```bash
+ansible-tui inventory/ playbook.yml
+```
 
 ```bash
 # Auto-discover inventory.yml and playbook.yml from CWD or parent dir
@@ -109,7 +183,7 @@ ansible-tui --version
 **Auto-discovery** checks both `.` and `..` for:
 
 - Inventory: `inventory.yml`, `inventory.yaml`, `hosts.yml`, `hosts.yaml`,
-  `hosts`
+  `hosts`, `inventory` (directory)
 - Playbook: `playbook.yml`, `playbook.yaml`, `site.yml`, `site.yaml`
 
 ### Run without installing (Deno)

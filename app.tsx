@@ -10,16 +10,16 @@
 // @deno-types="npm:@types/react@^18"
 import { useState, useMemo, useEffect, useRef } from "react";
 import { render, Box, Text, useInput, useApp, useStdout } from "ink";
-import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, statSync, readdirSync } from "node:fs";
 // @deno-types="npm:@types/js-yaml@^4"
 import { load as yamlLoad } from "js-yaml";
-import { resolve, dirname, relative } from "node:path";
+import { resolve, dirname, relative, join } from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
 import process from "node:process";
 
 // ===== Version =====
 
-const VERSION = "0.2.4";
+const VERSION = "0.2.7";
 
 // ===== Types =====
 
@@ -47,14 +47,180 @@ interface HostListItem {
 
 // ===== YAML Parsing =====
 
-function parseInventory(filePath: string): HostGroup[] {
-  const data = yamlLoad(readFileSync(filePath, "utf-8")) as any;
+function parseIniInventory(content: string): HostGroup[] {
   const groups: HostGroup[] = [];
-  for (const [name, val] of Object.entries(data?.all?.children || {})) {
-    const hosts = Object.keys((val as any)?.hosts || {});
-    if (hosts.length > 0) groups.push({ name, hosts });
+  const lines = content.split("\n");
+  let currentGroup = "";
+  const hosts: string[] = [];
+
+  for (let line of lines) {
+    line = line.trim();
+    
+    // Skip empty lines and comments
+    if (!line || line.startsWith(";") || line.startsWith("#")) continue;
+    
+    // Detect group headers [groupname]
+    if (line.startsWith("[") && line.endsWith("]")) {
+      // Save previous group if it has hosts
+      if (currentGroup && hosts.length > 0) {
+        groups.push({ name: currentGroup, hosts: [...hosts] });
+      }
+      currentGroup = line.slice(1, -1).trim();
+      hosts.length = 0; // Clear hosts for new group
+    } else if (currentGroup) {
+      // Parse hosts in group (can have inline variables like "host1 ansible_host=1.2.3.4")
+      const hostName = line.split(/\s+/)[0]; // Take everything before whitespace as hostname
+      if (hostName) {
+        hosts.push(hostName);
+      }
+    }
   }
+  
+  // Don't forget the last group
+  if (currentGroup && hosts.length > 0) {
+    groups.push({ name: currentGroup, hosts });
+  }
+  
   return groups;
+}
+
+function parseInventoryFile(filePath: string): HostGroup[] {
+  const content = readFileSync(filePath, "utf-8");
+  
+  // Check if it's an INI file (no extension or .ini/.cfg extension)
+  if (filePath.endsWith("ini") || filePath.endsWith("cfg") || !filePath.includes(".")) {
+    // Try parsing as INI first
+    try {
+      const groups = parseIniInventory(content);
+      if (groups.length > 0) return groups;
+    } catch {
+      // Fall through to YAML parsing
+    }
+  }
+  
+  // Parse as YAML
+  try {
+    const data = yamlLoad(content) as any;
+    const groups: HostGroup[] = [];
+    for (const [name, val] of Object.entries(data?.all?.children || {})) {
+      const hosts = Object.keys((val as any)?.hosts || {});
+      if (hosts.length > 0) groups.push({ name, hosts });
+    }
+    return groups;
+  } catch {
+    // If YAML parsing fails, try INI as fallback
+    return parseIniInventory(content);
+  }
+}
+
+function parseInventoryDirectory(dirPath: string): HostGroup[] {
+  const groups: HostGroup[] = [];
+  
+  try {
+    const entries = readdirSync(dirPath, { withFileTypes: true });
+    
+    for (const entry of entries) {
+      const fullPath = join(dirPath, entry.name);
+      
+      if (entry.isDirectory()) {
+        // Look for hosts file in subdirectory
+        const hostsNames = ["hosts.yml", "hosts.yaml", "main.yml", "main.yaml", "hosts"];
+        let hostsFile = null;
+        
+        for (const name of hostsNames) {
+          const candidate = join(fullPath, name);
+          if (existsSync(candidate)) {
+            hostsFile = candidate;
+            break;
+          }
+        }
+        
+        if (hostsFile) {
+          const data = yamlLoad(readFileSync(hostsFile, "utf-8")) as any;
+          const hosts: string[] = [];
+          
+          // Support multiple formats:
+          // Format 1: { hosts: [host1, host2] }
+          if (Array.isArray(data?.hosts)) {
+            hosts.push(...data.hosts);
+          }
+          // Format 2: { hosts: { host1: null, host2: null } }
+          else if (data?.hosts && typeof data.hosts === "object") {
+            hosts.push(...Object.keys(data.hosts));
+          }
+          // Format 3: Direct array at root level
+          else if (Array.isArray(data)) {
+            hosts.push(...data.filter(h => typeof h === "string"));
+          }
+          
+          if (hosts.length > 0) {
+            groups.push({ name: entry.name, hosts });
+          }
+        }
+      } else if (entry.isFile() && (entry.name.endsWith(".yml") || entry.name.endsWith(".yaml"))) {
+        // YAML files at root level (filename becomes group name)
+        const groupName = entry.name.replace(/\.(yml|yaml)$/, "");
+        const data = yamlLoad(readFileSync(fullPath, "utf-8")) as any;
+        const hosts: string[] = [];
+        
+        // Support multiple formats
+        if (Array.isArray(data?.hosts)) {
+          hosts.push(...data.hosts);
+        } else if (data?.hosts && typeof data.hosts === "object") {
+          hosts.push(...Object.keys(data.hosts));
+        } else if (Array.isArray(data)) {
+          hosts.push(...data.filter(h => typeof h === "string"));
+        }
+        
+        if (hosts.length > 0) {
+          groups.push({ name: groupName, hosts });
+        }
+      } else if (entry.isFile() && (entry.name.endsWith(".ini") || entry.name.endsWith(".cfg") || (!entry.name.includes(".") && !entry.name.startsWith(".")))) {
+        // INI files or extensionless files (like "management", "hosts", etc)
+        try {
+          const content = readFileSync(fullPath, "utf-8");
+          const parsedGroups = parseIniInventory(content);
+          
+          if (parsedGroups.length > 0) {
+            // If file has multiple groups, add them all
+            groups.push(...parsedGroups);
+          } else {
+            // If no groups found in INI, treat whole file as single group with filename as group name
+            const groupName = entry.name;
+            const hosts = content
+              .split("\n")
+              .map(line => line.trim())
+              .filter(line => line && !line.startsWith("#") && !line.startsWith(";"))
+              .map(line => line.split(/\s+/)[0]);
+            
+            if (hosts.length > 0) {
+              groups.push({ name: groupName, hosts });
+            }
+          }
+        } catch (e) {
+          // Skip files that can't be parsed
+        }
+      }
+    }
+  } catch (e) {
+    console.error(`Error parsing inventory directory: ${e}`);
+  }
+  
+  return groups;
+}
+
+function parseInventory(inventoryPath: string): HostGroup[] {
+  try {
+    const stat = statSync(inventoryPath);
+    if (stat.isDirectory()) {
+      return parseInventoryDirectory(inventoryPath);
+    } else {
+      return parseInventoryFile(inventoryPath);
+    }
+  } catch {
+    // Fall back to file parsing for backward compatibility
+    return parseInventoryFile(inventoryPath);
+  }
 }
 
 interface ParsedNode {
@@ -652,14 +818,17 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
 
 // ===== Entry =====
 
-const INVENTORY_NAMES = ["inventory.yml", "inventory.yaml", "hosts.yml", "hosts.yaml", "hosts"];
+const INVENTORY_NAMES = ["inventory.yml", "inventory.yaml", "hosts.yml", "hosts.yaml", "hosts", "inventory"];
 const PLAYBOOK_NAMES = ["playbook.yml", "playbook.yaml", "site.yml", "site.yaml"];
 
 function findFile(candidates: string[]): string {
   const cwd = process.cwd();
   for (const name of candidates) {
-    if (existsSync(resolve(cwd, name))) return resolve(cwd, name);
-    if (existsSync(resolve(cwd, "..", name))) return resolve(cwd, "..", name);
+    const basePath = resolve(cwd, name);
+    const parentPath = resolve(cwd, "..", name);
+    
+    if (existsSync(basePath)) return basePath;
+    if (existsSync(parentPath)) return parentPath;
   }
   console.error(`Cannot find any of [${candidates.join(", ")}] in . or ..`);
   process.exit(1);
