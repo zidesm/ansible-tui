@@ -628,7 +628,6 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
       const isBackspace =
         key.backspace ||
         key.delete ||
-        key.backspaceDelete ||
         input === "\b" ||
         input === "\x7f";
       if (isBackspace) {
@@ -925,7 +924,9 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
           </Box>
           <Box flexDirection="column" paddingX={1}>
             {searchMode && searchPanel === "hosts" && (
-              <Text color="cyan" marginBottom={1}>/ {hostSearchQuery}</Text>
+              <Box marginBottom={1}>
+                <Text color="cyan">/ {hostSearchQuery}</Text>
+              </Box>
             )}
             {hostSlice.length === 0 && hostSearchQuery ? (
               <Text dimColor>No hosts match "{hostSearchQuery}"</Text>
@@ -974,7 +975,9 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
           </Box>
           <Box flexDirection="column" paddingX={1}>
             {searchMode && searchPanel === "playbook" && (
-              <Text color="cyan" marginBottom={1}>/ {playbookSearchQuery}</Text>
+              <Box marginBottom={1}>
+                <Text color="cyan">/ {playbookSearchQuery}</Text>
+              </Box>
             )}
             {pbSlice.length === 0 && playbookSearchQuery ? (
               <Text dimColor>No playbook items match "{playbookSearchQuery}"</Text>
