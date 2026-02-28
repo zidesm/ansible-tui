@@ -254,6 +254,20 @@ function extractNodes(tasks: any[], inherited: string[] = []): ParsedNode[] {
 }
 
 function parsePlaybook(filePath: string): FlatItem[] {
+  try {
+    const stat = statSync(filePath);
+    if (stat.isDirectory()) {
+      return parsePlaybookDirectory(filePath);
+    } else {
+      return parsePlaybookFile(filePath);
+    }
+  } catch {
+    // Fall back to file parsing for backward compatibility
+    return parsePlaybookFile(filePath);
+  }
+}
+
+function parsePlaybookFile(filePath: string): FlatItem[] {
   const plays = yamlLoad(readFileSync(filePath, "utf-8")) as any[];
   const items: FlatItem[] = [];
   (plays || []).forEach((play: any, pi: number) => {
@@ -283,6 +297,62 @@ function parsePlaybook(filePath: string): FlatItem[] {
     };
     flatten(extractNodes(play.tasks || []), 1);
   });
+  return items;
+}
+
+function parsePlaybookDirectory(dirPath: string): FlatItem[] {
+  const items: FlatItem[] = [];
+  let playIndex = 0;
+  
+  try {
+    const entries = readdirSync(dirPath, { withFileTypes: true });
+    const yamlFiles = entries
+      .filter((e) => e.isFile() && (e.name.endsWith(".yml") || e.name.endsWith(".yaml")))
+      .sort((a, b) => a.name.localeCompare(b.name));
+    
+    for (const entry of yamlFiles) {
+      const fullPath = join(dirPath, entry.name);
+      try {
+        const plays = yamlLoad(readFileSync(fullPath, "utf-8")) as any[];
+        (plays || []).forEach((play: any) => {
+          const playName = play?.name || entry.name.replace(/\.(yml|yaml)$/, "");
+          if (!playName) return;
+          
+          const pt: string[] = Array.isArray(play.tags) ? play.tags : play.tags ? [play.tags] : [];
+          const pi = playIndex;
+          items.push({
+            id: `p${pi}`, label: playName, depth: 0, type: "play",
+            tags: pt.filter((t) => t !== "never"), hasNever: pt.includes("never"), playIndex: pi,
+          });
+          let taskIdx = 0, blockIdx = 0;
+          const flatten = (nodes: ParsedNode[], depth: number, parentId?: string) => {
+            for (const node of nodes) {
+              if (node.type === "block") {
+                const id = `p${pi}b${blockIdx++}`;
+                items.push({
+                  id, label: node.name, depth, type: "block",
+                  tags: node.tags, hasNever: node.hasNever, playIndex: pi, parentId,
+                });
+                if (node.children) flatten(node.children, depth + 1, id);
+              } else {
+                items.push({
+                  id: `p${pi}t${taskIdx++}`, label: node.name, depth, type: "task",
+                  tags: node.tags, hasNever: node.hasNever, playIndex: pi, parentId,
+                });
+              }
+            }
+          };
+          flatten(extractNodes(play.tasks || []), 1);
+          playIndex++;
+        });
+      } catch (e) {
+        // Skip files that can't be parsed
+      }
+    }
+  } catch (e) {
+    // Silently fail
+  }
+  
   return items;
 }
 
@@ -320,6 +390,7 @@ interface PersistedState {
   hostSel: string[];
   taskSel: string[];
   expanded: string[];
+  expandedGroups: string[];
   checkFlag?: boolean;
   diffFlag?: boolean;
   section?: "hosts" | "playbook";
@@ -331,6 +402,8 @@ function loadState(filePath: string): PersistedState | null {
   try {
     const data = JSON.parse(readFileSync(filePath, "utf-8"));
     if (data && Array.isArray(data.hostSel) && Array.isArray(data.taskSel) && Array.isArray(data.expanded)) {
+      // Ensure expandedGroups exists for backward compatibility
+      if (!Array.isArray(data.expandedGroups)) data.expandedGroups = [];
       return data as PersistedState;
     }
     return null;
@@ -356,15 +429,6 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
   const { stdout } = useStdout();
   const rows = stdout?.rows ?? 40;
 
-  const flatHosts = useMemo<HostListItem[]>(() => {
-    const out: HostListItem[] = [];
-    for (const g of hostGroups) {
-      out.push({ kind: "group", name: g.name });
-      for (const h of g.hosts) out.push({ kind: "host", name: h, group: g.name });
-    }
-    return out;
-  }, [hostGroups]);
-
   // -- Selection state (persisted across phases) --
   const [section, setSection] = useState<"hosts" | "playbook">(initialState?.section ?? "hosts");
   const [hCur, setHCur] = useState(initialState?.hCur ?? 0);
@@ -372,14 +436,49 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
   const [hostSel, setHostSel] = useState<Set<string>>(() => new Set(initialState?.hostSel ?? []));
   const [taskSel, setTaskSel] = useState<Set<string>>(() => new Set(initialState?.taskSel ?? []));
   const [expanded, setExpanded] = useState<Set<string>>(() => new Set(initialState?.expanded ?? []));
+  const [expandedGroups, setExpandedGroups] = useState<Set<string>>(() => new Set(initialState?.expandedGroups ?? [...hostGroups.map(g => g.name)]));
   const [checkFlag, setCheckFlag] = useState(initialState?.checkFlag ?? false);
   const [diffFlag, setDiffFlag] = useState(initialState?.diffFlag ?? false);
   const [warnMsg, setWarnMsg] = useState<string | null>(null);
+  const [searchMode, setSearchMode] = useState(false);
+  const [searchPanel, setSearchPanel] = useState<"hosts" | "playbook" | null>(null);
+  const [hostSearchQuery, setHostSearchQuery] = useState("");
+  const [playbookSearchQuery, setPlaybookSearchQuery] = useState("");
+
+  const flatHosts = useMemo<HostListItem[]>(() => {
+    const out: HostListItem[] = [];
+    for (const g of hostGroups) {
+      out.push({ kind: "group", name: g.name });
+      if (expandedGroups.has(g.name)) {
+        for (const h of g.hosts) out.push({ kind: "host", name: h, group: g.name });
+      }
+    }
+    return out;
+  }, [hostGroups, expandedGroups]);
+
+  // Filter hosts based on search query
+  const filteredHosts = useMemo<HostListItem[]>(() => {
+    if (!hostSearchQuery) return flatHosts;
+    const query = hostSearchQuery.toLowerCase();
+    const out: HostListItem[] = [];
+    for (const group of hostGroups) {
+      const groupMatches = group.name.toLowerCase().includes(query);
+      const matchingHosts = group.hosts.filter((h) => h.toLowerCase().includes(query));
+      if (groupMatches || matchingHosts.length > 0) {
+        out.push({ kind: "group", name: group.name });
+        const hostsToShow = groupMatches ? group.hosts : matchingHosts;
+        for (const h of hostsToShow) {
+          out.push({ kind: "host", name: h, group: group.name });
+        }
+      }
+    }
+    return out;
+  }, [flatHosts, hostGroups, hostSearchQuery]);
 
   // Track live state for persistence on exit
   useEffect(() => {
-    currentState = { hostSel: [...hostSel], taskSel: [...taskSel], expanded: [...expanded], checkFlag, diffFlag, section, hCur, pCur };
-  }, [hostSel, taskSel, expanded, checkFlag, diffFlag, section, hCur, pCur]);
+    currentState = { hostSel: [...hostSel], taskSel: [...taskSel], expanded: [...expanded], expandedGroups: [...expandedGroups], checkFlag, diffFlag, section, hCur, pCur };
+  }, [hostSel, taskSel, expanded, expandedGroups, checkFlag, diffFlag, section, hCur, pCur]);
 
   // Auto-dismiss warning after 2s
   useEffect(() => {
@@ -387,6 +486,14 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
     const t = setTimeout(() => setWarnMsg(null), 2000);
     return () => clearTimeout(t);
   }, [warnMsg]);
+
+  useEffect(() => {
+    setHCur(0);
+  }, [hostSearchQuery]);
+
+  useEffect(() => {
+    setPCur(0);
+  }, [playbookSearchQuery]);
 
   // -- Execution state --
   const [phase, setPhase] = useState<Phase>("select");
@@ -432,16 +539,25 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
     return true;
   }), [items, expanded]);
 
+  const filteredVisible = useMemo(() => {
+    if (!playbookSearchQuery) return visible;
+    const query = playbookSearchQuery.toLowerCase();
+    return visible.filter((it) =>
+      it.label.toLowerCase().includes(query) ||
+      it.tags.some((t) => t.toLowerCase().includes(query))
+    );
+  }, [visible, playbookSearchQuery]);
+
   // Viewports for scrolling
   const viewH = Math.max(10, rows - 19); // Reserved rows for header, borders, commands, footer
 
-  const safePCur = Math.max(0, Math.min(pCur, visible.length - 1));
-  const pScrollStart = Math.max(0, Math.min(safePCur - Math.floor(viewH / 2), Math.max(0, visible.length - viewH)));
-  const pbSlice = visible.slice(pScrollStart, pScrollStart + viewH);
+  const safePCur = Math.max(0, Math.min(pCur, filteredVisible.length - 1));
+  const pScrollStart = Math.max(0, Math.min(safePCur - Math.floor(viewH / 2), Math.max(0, filteredVisible.length - viewH)));
+  const pbSlice = filteredVisible.slice(pScrollStart, pScrollStart + viewH);
 
-  const safeHCur = Math.max(0, Math.min(hCur, flatHosts.length - 1));
-  const hScrollStart = Math.max(0, Math.min(safeHCur - Math.floor(viewH / 2), Math.max(0, flatHosts.length - viewH)));
-  const hostSlice = flatHosts.slice(hScrollStart, hScrollStart + viewH);
+  const safeHCur = Math.max(0, Math.min(hCur, filteredHosts.length - 1));
+  const hScrollStart = Math.max(0, Math.min(safeHCur - Math.floor(viewH / 2), Math.max(0, filteredHosts.length - viewH)));
+  const hostSlice = filteredHosts.slice(hScrollStart, hScrollStart + viewH);
 
   const cmd = buildCommand(hostSel, taskSel, items, inv, pb, allHostsSelected);
   const fullCmd = cmd + (checkFlag ? " --check" : "") + (diffFlag ? " --diff" : "");
@@ -492,6 +608,48 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
 
   // -- Input handling --
   useInput((input, key) => {
+    // --- Search mode handling ---
+    if (searchMode) {
+      if (key.escape) {
+        if (searchPanel === "hosts") {
+          setHostSearchQuery("");
+          setHCur(0);
+        } else if (searchPanel === "playbook") {
+          setPlaybookSearchQuery("");
+          setPCur(0);
+        }
+        setSearchMode(false);
+        return;
+      }
+      if (key.return) {
+        setSearchMode(false);
+        return;
+      }
+      const isBackspace =
+        key.backspace ||
+        key.delete ||
+        key.backspaceDelete ||
+        input === "\b" ||
+        input === "\x7f";
+      if (isBackspace) {
+        if (searchPanel === "hosts") {
+          setHostSearchQuery((q) => q.slice(0, -1));
+        } else if (searchPanel === "playbook") {
+          setPlaybookSearchQuery((q) => q.slice(0, -1));
+        }
+        return;
+      }
+      if (input && input.length === 1 && input.charCodeAt(0) >= 32) {
+        if (searchPanel === "hosts") {
+          setHostSearchQuery((q) => q + input);
+        } else if (searchPanel === "playbook") {
+          setPlaybookSearchQuery((q) => q + input);
+        }
+        return;
+      }
+      return;
+    }
+
     // --- Running phase: only allow cancel ---
     if (phase === "running") {
       if (input === "q") childRef.current?.kill();
@@ -515,6 +673,11 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
     if (input === "q") return app.exit();
     if (input === "c") return setCheckFlag((f) => !f);
     if (input === "d") return setDiffFlag((f) => !f);
+    if (input === "/") {
+      setSearchPanel(section);
+      setSearchMode(true);
+      return;
+    }
     if (input === "r") {
       // Guard: warn if no hosts or no tasks selected
       if (hostSel.size === 0) { setWarnMsg("⚠ No hosts selected — add hosts first (Space)"); return; }
@@ -530,27 +693,39 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
     }
     if (key.tab) return setSection((s) => (s === "hosts" ? "playbook" : "hosts"));
 
-    // -- Expand all / collapse all (only in playbook section) --
+    // -- Expand all / collapse all --
     if (input === "e") {
-      const playIds = items.filter((i) => i.type === "play").map((i) => i.id);
-      const blockIds = items.filter((i) => i.type === "block").map((i) => i.id);
-      const allIds = [...playIds, ...blockIds];
-      const allExpanded = allIds.every((id) => expanded.has(id));
-      setExpanded(allExpanded ? new Set() : new Set(allIds));
+      if (section === "hosts") {
+        // Toggle all host groups
+        const allGroupNames = hostGroups.map((g) => g.name);
+        setExpandedGroups((prev) => {
+          const allExpanded = allGroupNames.length > 0 && allGroupNames.every((name) => prev.has(name));
+          return allExpanded ? new Set() : new Set(allGroupNames);
+        });
+      } else if (section === "playbook") {
+        // Toggle all plays and blocks
+        const playIds = items.filter((i) => i.type === "play").map((i) => i.id);
+        const blockIds = items.filter((i) => i.type === "block").map((i) => i.id);
+        const allIds = [...playIds, ...blockIds];
+        setExpanded((prev) => {
+          const allExpanded = allIds.length > 0 && allIds.every((id) => prev.has(id));
+          return allExpanded ? new Set() : new Set(allIds);
+        });
+      }
       return;
     }
 
     // -- Host section --
     if (section === "hosts") {
       if (key.upArrow) setHCur((c) => Math.max(0, c - 1));
-      if (key.downArrow) setHCur((c) => Math.min(flatHosts.length - 1, c + 1));
+      if (key.downArrow) setHCur((c) => Math.min(filteredHosts.length - 1, c + 1));
       if (key.pageUp) setHCur((c) => Math.max(0, c - viewH));
-      if (key.pageDown) setHCur((c) => Math.min(flatHosts.length - 1, c + viewH));
+      if (key.pageDown) setHCur((c) => Math.min(filteredHosts.length - 1, c + viewH));
       if (input === "a") {
         setHostSel((p) => (allUniqueHosts.size === p.size && [...p].every(h => allUniqueHosts.has(h)) ? new Set() : new Set(allUniqueHosts)));
       }
       if (input === " ") {
-        const hi = flatHosts[hCur];
+        const hi = filteredHosts[safeHCur];
         if (!hi) return;
         setHostSel((prev) => {
           const n = new Set(prev);
@@ -564,16 +739,28 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
           return n;
         });
       }
+      if (key.rightArrow || key.return) {
+        const hi = filteredHosts[safeHCur];
+        if (hi?.kind === "group") {
+          setExpandedGroups((prev) => new Set(prev).add(hi.name));
+        }
+      }
+      if (key.leftArrow) {
+        const hi = filteredHosts[safeHCur];
+        if (hi?.kind === "group") {
+          setExpandedGroups((prev) => { const n = new Set(prev); n.delete(hi.name); return n; });
+        }
+      }
     }
 
     // -- Playbook section --
-    if (section === "playbook" && visible.length > 0) {
+    if (section === "playbook" && filteredVisible.length > 0) {
       if (key.upArrow) setPCur((c) => Math.max(0, c - 1));
-      if (key.downArrow) setPCur((c) => Math.min(visible.length - 1, c + 1));
+      if (key.downArrow) setPCur((c) => Math.min(filteredVisible.length - 1, c + 1));
       if (key.pageUp) setPCur((c) => Math.max(0, c - viewH));
-      if (key.pageDown) setPCur((c) => Math.min(visible.length - 1, c + viewH));
+      if (key.pageDown) setPCur((c) => Math.min(filteredVisible.length - 1, c + viewH));
       if (input === " ") {
-        const it = visible[safePCur];
+        const it = filteredVisible[safePCur];
         if (!it) return;
         setTaskSel((prev) => {
           const n = new Set(prev);
@@ -615,26 +802,29 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
         });
       }
       if (key.return || key.rightArrow) {
-        const it = visible[safePCur];
-        if (it?.type === "play" || it?.type === "block") setExpanded((p) => new Set(p).add(it.id));
+        const it = filteredVisible[safePCur];
+        if (it?.type === "play" || it?.type === "block") {
+          setExpanded((prev) => new Set(prev).add(it.id));
+        }
       }
       if (key.leftArrow) {
-        const it = visible[safePCur];
+        const it = filteredVisible[safePCur];
         if (it?.type === "play") {
-          setExpanded((p) => { const n = new Set(p); n.delete(it.id); return n; });
+          setExpanded((prev) => { const n = new Set(prev); n.delete(it.id); return n; });
         } else if (it?.type === "block") {
-          if (expanded.has(it.id)) {
-            setExpanded((p) => { const n = new Set(p); n.delete(it.id); return n; });
+          const isExpanded = expanded.has(it.id);
+          if (isExpanded) {
+            setExpanded((prev) => { const n = new Set(prev); n.delete(it.id); return n; });
           } else {
             // Jump to parent (play or parent block)
             const target = it.parentId ?? `p${it.playIndex}`;
-            const idx = visible.findIndex((v) => v.id === target);
+            const idx = filteredVisible.findIndex((v) => v.id === target);
             if (idx >= 0) setPCur(idx);
           }
         } else if (it?.type === "task") {
           // Jump to parent block or play
           const target = it.parentId ?? `p${it.playIndex}`;
-          const idx = visible.findIndex((v) => v.id === target);
+          const idx = filteredVisible.findIndex((v) => v.id === target);
           if (idx >= 0) setPCur(idx);
         }
       }
@@ -714,15 +904,7 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
 
   // ====== Render: Select ======
   return (
-    <Box flexDirection="column" paddingX={2} paddingY={1} width="100%">
-      <Box marginBottom={1} flexDirection="row" justifyContent="space-between">
-        <Text bold color="cyan" backgroundColor="blue"> 🚀 Ansible TUI Runner </Text>
-        <Box flexDirection="row" gap={2}>
-          {warnMsg && <Text bold color="yellow">{warnMsg}</Text>}
-          {!warnMsg && lastResult !== "" && <Text color={lastResult.includes("✓") ? "green" : "red"}>{lastResult}</Text>}
-        </Box>
-      </Box>
-
+    <Box flexDirection="column" paddingX={2} paddingY={0} width="100%">
       <Box width="100%" flexDirection="row" gap={2}>
         {/* -- Hosts Panel -- */}
         <Box flexDirection="column" width="35%" borderStyle="round" borderColor={section === "hosts" ? "cyan" : "gray"}>
@@ -730,27 +912,44 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
             <Text bold color={section === "hosts" ? "cyan" : "white"}>
               {section === "hosts" ? "❯ " : "  "}Hosts
             </Text>
-            <Text color={selectedHostCount > 0 ? "green" : "gray"} dimColor={selectedHostCount === 0}>
-              {selectedHostCount}/{totalHosts} selected
-            </Text>
+            <Box flexDirection="row" gap={2}>
+              {section === "hosts" && (
+                <Text dimColor>
+                  <Text bold color="white">[/]</Text>
+                </Text>
+              )}
+              <Text color={selectedHostCount > 0 ? "green" : "gray"} dimColor={selectedHostCount === 0}>
+                {selectedHostCount}/{totalHosts} selected
+              </Text>
+            </Box>
           </Box>
           <Box flexDirection="column" paddingX={1}>
-            {hostSlice.map((hi, i) => {
-              const ri = hScrollStart + i;
-              const cur = section === "hosts" && ri === hCur;
-              const ind = hi.kind === "host" ? "  " : "";
-              const lbl = hi.kind === "group"
-                ? `${hi.name} (${hostGroups.find((g) => g.name === hi.name)!.hosts.filter((h) => hostSel.has(h)).length}/${hostGroups.find((g) => g.name === hi.name)!.hosts.length})`
-                : hi.name;
-              return (
-                <Text key={`h${ri}`} color={cur ? "yellow" : undefined} bold={hi.kind === "group"}>
-                  {cur ? "❯" : " "} {ind}[{hCheck(hi)}] {lbl}
-                </Text>
-              );
-            })}
-            {flatHosts.length > viewH && (
+            {searchMode && searchPanel === "hosts" && (
+              <Text color="cyan" marginBottom={1}>/ {hostSearchQuery}</Text>
+            )}
+            {hostSlice.length === 0 && hostSearchQuery ? (
+              <Text dimColor>No hosts match "{hostSearchQuery}"</Text>
+            ) : (
+              hostSlice.map((hi, i) => {
+                const ri = hScrollStart + i;
+                const cur = section === "hosts" && ri === safeHCur;
+                const arrow = hi.kind === "group"
+                  ? (expandedGroups.has(hi.name) ? "▼ " : "▶ ")
+                  : "  ";
+                const ind = hi.kind === "host" ? "  " : "";
+                const lbl = hi.kind === "group"
+                  ? `${hi.name} (${hostGroups.find((g) => g.name === hi.name)!.hosts.filter((h) => hostSel.has(h)).length}/${hostGroups.find((g) => g.name === hi.name)!.hosts.length})`
+                  : hi.name;
+                return (
+                  <Text key={`h${ri}`} color={cur ? "yellow" : undefined} bold={hi.kind === "group"}>
+                    {ind}{arrow}[{hCheck(hi)}] {lbl}
+                  </Text>
+                );
+              })
+            )}
+            {filteredHosts.length > viewH && (
               <Text dimColor>
-                ({hScrollStart + 1}–{Math.min(hScrollStart + viewH, flatHosts.length)}/{flatHosts.length})
+                ({hScrollStart + 1}–{Math.min(hScrollStart + viewH, filteredHosts.length)}/{filteredHosts.length})
               </Text>
             )}
           </Box>
@@ -762,42 +961,56 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
             <Text bold color={section === "playbook" ? "cyan" : "white"}>
               {section === "playbook" ? "❯ " : "  "}Playbook
             </Text>
-            <Text color={selectedTaskCount > 0 ? "green" : "gray"} dimColor={selectedTaskCount === 0}>
-              {selectedTaskCount}/{totalTasks} tasks
-            </Text>
+            <Box flexDirection="row" gap={2}>
+              {section === "playbook" && (
+                <Text dimColor>
+                  <Text bold color="white">[/]</Text>
+                </Text>
+              )}
+              <Text color={selectedTaskCount > 0 ? "green" : "gray"} dimColor={selectedTaskCount === 0}>
+                {selectedTaskCount}/{totalTasks} tasks
+              </Text>
+            </Box>
           </Box>
           <Box flexDirection="column" paddingX={1}>
-            {pbSlice.map((it, vi) => {
-              const ri = pScrollStart + vi;
-              const cur = section === "playbook" && ri === pCur;
-              const arrow = (it.type === "play" || it.type === "block")
-                ? (expanded.has(it.id) ? "▼ " : "▶ ") : "  ";
-              const ind = "  ".repeat(it.depth);
-              return (
-                <Box key={it.id}>
-                  <Text
-                    color={
-                      cur ? "yellow"
-                      : it.type === "play" ? "cyan"
-                      : it.type === "block" ? "white"
-                      : undefined
-                    }
-                    bold={cur || it.type === "play" || it.type === "block"}
-                  >
-                    {cur ? "❯" : " "} {ind}{arrow}[{tCheck(it)}] {it.label}
-                  </Text>
-                  {it.tags.length > 0 && (
-                    <Text color="cyan" dimColor> [{it.tags.join(",")}]</Text>
-                  )}
-                  {it.hasNever && (
-                    <Text color="magenta" dimColor> (never)</Text>
-                  )}
-                </Box>
-              );
-            })}
-            {visible.length > viewH && (
+            {searchMode && searchPanel === "playbook" && (
+              <Text color="cyan" marginBottom={1}>/ {playbookSearchQuery}</Text>
+            )}
+            {pbSlice.length === 0 && playbookSearchQuery ? (
+              <Text dimColor>No playbook items match "{playbookSearchQuery}"</Text>
+            ) : (
+              pbSlice.map((it, vi) => {
+                const ri = pScrollStart + vi;
+                const cur = section === "playbook" && ri === safePCur;
+                const arrow = (it.type === "play" || it.type === "block")
+                  ? (expanded.has(it.id) ? "▼ " : "▶ ") : "  ";
+                const ind = "  ".repeat(it.depth);
+                return (
+                  <Box key={it.id}>
+                    <Text
+                      color={
+                        cur ? "yellow"
+                        : it.type === "play" ? "cyan"
+                        : it.type === "block" ? "white"
+                        : undefined
+                      }
+                      bold={cur || it.type === "play" || it.type === "block"}
+                    >
+                      {ind}{arrow}[{tCheck(it)}] {it.label}
+                    </Text>
+                    {it.tags.length > 0 && (
+                      <Text color="cyan" dimColor> [{it.tags.join(",")}]</Text>
+                    )}
+                    {it.hasNever && (
+                      <Text color="magenta" dimColor> (never)</Text>
+                    )}
+                  </Box>
+                );
+              })
+            )}
+            {filteredVisible.length > viewH && (
               <Text dimColor>
-                ({pScrollStart + 1}–{Math.min(pScrollStart + viewH, visible.length)}/{visible.length})
+                ({pScrollStart + 1}–{Math.min(pScrollStart + viewH, filteredVisible.length)}/{filteredVisible.length})
               </Text>
             )}
           </Box>
@@ -809,6 +1022,8 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
         <Box flexDirection="row" justifyContent="space-between">
           <Text bold color="green">Command Preview</Text>
           <Box flexDirection="row" gap={3}>
+            {warnMsg && <Text bold color="yellow">{warnMsg}</Text>}
+            {!warnMsg && lastResult !== "" && <Text color={lastResult.includes("✓") ? "green" : "red"}>{lastResult}</Text>}
             <Text color={checkFlag ? "yellow" : "gray"}>--check {checkFlag ? "ON" : "off"}</Text>
             <Text color={diffFlag ? "yellow" : "gray"}>--diff {diffFlag ? "ON" : "off"}</Text>
             {!hasTags && hasTaskSelection && hasUntaggedSel && (
@@ -832,7 +1047,7 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
           <Text bold color="white">[Tab]</Text> Switch Panel   <Text bold color="white">[Space]</Text> Toggle   <Text bold color="white">[a]</Text> All Hosts   <Text bold color="white">[e]</Text> Expand/Collapse All   <Text bold color="white">[→/Enter]</Text> Expand   <Text bold color="white">[←]</Text> Collapse
         </Text>
         <Text dimColor>
-          <Text bold color="white">[r]</Text> Run   <Text bold color="white">[c]</Text> --check   <Text bold color="white">[d]</Text> --diff   <Text bold color="white">[s]</Text> Show Cmd   <Text bold color="white">[PgUp/PgDn]</Text> Page   <Text bold color="white">[q]</Text> Quit
+          <Text bold color="white">[r]</Text> Run   <Text bold color="white">[c]</Text> --check   <Text bold color="white">[d]</Text> --diff   <Text bold color="white">[s]</Text> Show Cmd   <Text bold color="white">[PgUp/PgDn]</Text> Page   <Text bold color="white">[/]</Text> Search   <Text bold color="white">[Esc]</Text> Clear   <Text bold color="white">[q]</Text> Quit
         </Text>
       </Box>
     </Box>
@@ -842,7 +1057,7 @@ function App({ hostGroups, items, inv, pb, cwd, initialState }: {
 // ===== Entry =====
 
 const INVENTORY_NAMES = ["inventory.yml", "inventory.yaml", "hosts.yml", "hosts.yaml", "hosts", "inventory"];
-const PLAYBOOK_NAMES = ["playbook.yml", "playbook.yaml", "site.yml", "site.yaml"];
+const PLAYBOOK_NAMES = ["playbook.yml", "playbook.yaml", "site.yml", "site.yaml", "playbooks"];
 
 function findFile(candidates: string[]): string {
   const cwd = process.cwd();
